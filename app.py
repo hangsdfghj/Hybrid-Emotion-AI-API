@@ -1,4 +1,8 @@
 import os
+# 關鍵優化：抑制 TensorFlow 的啟動日誌和警告，以加速啟動
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # 確保使用 CPU
+
 import numpy as np
 import jieba
 import tensorflow as tf
@@ -9,46 +13,48 @@ from google.genai import types
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# --- 0. 全局變數與模型載入 (僅在服務啟動時執行一次) ---
+# --- 0. 全域變數與模型載入 (僅在服務啟動時執行一次) ---
 
-# 🚨 安全提醒：實際部署時，請使用環境變數或密鑰管理服務。
-# os.environ['GEMINI_API_KEY'] = 'AIzaSyA-YzMyQt_BIccMVqnt9t2IjoWq12P5rbQ'
+# Gemini 客戶端會自動從環境變數 GEMINI_API_KEY 讀取金鑰
 client = genai.Client()
 
 emotion_classes = np.array(['厭惡', '喜悅', '平靜', '悲傷', '憤怒', '期待', '焦慮', '驚訝']) 
 max_len = 16 
 
-# 載入你訓練好的模型
+# 載入你訓練好的 LSTM 模型
 try:
     final_model = load_model('emotion_model.h5')
     print("模型載入成功。")
 except Exception as e:
     print(f"錯誤：無法載入 emotion_model.h5。請確認檔案是否存在。錯誤訊息: {e}")
-    # 服務啟動失敗，應停止
 
-# 🌟 【重要步驟：載入或重建 Tokenizer】🌟
-# 由於 tokenizer 變數不會被保存在 .h5 檔案中，你必須在這裡重新定義或載入它！
-# 最簡單的方法是從你的 CSV 數據中重建它，像你之前在 Notebook 中做的那樣。
-
-# 假設你已經在這裡重建了 tokenizer 變數：
+# 修正後的 Tokenizer 重建邏輯
 import pandas as pd
 from tensorflow.keras.preprocessing.text import Tokenizer
 
 print("--- 正在重建 Tokenizer... ---")
-# 警告：如果 emotion_data.csv 不在 app.py 同一資料夾，這裡會失敗
-df = pd.read_csv('emotion_data.csv', header=None, names=['text', 'emotion'])
-df['tokens'] = df['text'].apply(lambda x: list(jieba.cut(x, cut_all=False)))
-texts = [" ".join(tokens) for tokens in df['tokens']]
-tokenizer = Tokenizer(num_words=5000, oov_token="<unk>") 
-tokenizer.fit_on_texts(texts)
+try:
+    # 載入數據用於重建 Tokenizer
+    df = pd.read_csv('emotion_data.csv', header=None, names=['text', 'emotion'])
+    
+    # 重新執行分詞與建立
+    df['tokens'] = df['text'].apply(lambda x: list(jieba.cut(x, cut_all=False)))
+    texts = [" ".join(tokens) for tokens in df['tokens']]
+    
+    # 重新建立 Tokenizer 變數
+    tokenizer = Tokenizer(num_words=5000, oov_token="<unk>") 
+    tokenizer.fit_on_texts(texts)
+    
+    print("'tokenizer' 已成功從 emotion_data.csv 重建！")
 
-print("'tokenizer' 已成功從 emotion_data.csv 重建！")
+except FileNotFoundError:
+    print("FATAL ERROR: 無法找到 'emotion_data.csv' 檔案。請確保它在 app.py 的同一個資料夾中！")
 
-# --- 1. 核心邏輯函式 (複製自你的 Notebook) ---
+# --- 1. 核心邏輯函式 ---
 
 # 1.1 LSTM 判斷情緒
 def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
-    # 這裡假設 tokenizer 已經作為全局變數定義
+    """使用 LSTM 模型預測輸入文本的情緒。"""
     tokens = list(jieba.cut(text_input, cut_all=False))
     text_processed = [" ".join(tokens)]
     sequence = tokenizer.texts_to_sequences(text_processed)
@@ -61,7 +67,7 @@ def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
     
     return predicted_emotion, confidence
 
-# 1.2 推薦邏輯 (你定稿的表格)
+# 1.2 推薦邏輯 (情緒與活動類型的對應表)
 recommendation_logic = {
     '喜悅': {'type': '社交型興趣 / 分享', 'reason': '你心情超棒！是時候跟朋友分享這份喜悅，舉辦一場美食聚會吧！'},
     '悲傷': {'type': '創造型 / 發洩型興趣', 'reason': '你現在的情緒需要出口，不如拿起紙筆畫下你的心情，或寫點東西吧！讓創作替你說出那些說不出口的感受。'},
@@ -73,10 +79,18 @@ recommendation_logic = {
     '驚訝': {'type': '探索型 / 認知型興趣', 'reason': '哇！你的好奇心被點亮了！不如趁勢多了解一下剛剛讓你驚訝的事，查資料、看影片，讓驚訝變成有趣的新發現。'}
 }
 
-# 1.3 生成式推薦函式 (Gemini 組織語言)
+# 1.3 生成式推薦函式 (Gemini 組織語言與錯誤處理)
 def generate_conversational_recommendation(text_input, model, logic, client):
-    # with graph.as_default(): # 適用於舊版 TensorFlow 多執行緒
-    predicted_emotion, confidence = predict_emotion(text_input, model, tokenizer, max_len, emotion_classes)
+    """結合情緒預測結果，呼叫 Gemini 生成個性化的教練建議。"""
+    try:
+        # 進行情緒預測
+        predicted_emotion, confidence = predict_emotion(text_input, final_model, tokenizer, max_len, emotion_classes)
+    except Exception as e:
+        return {
+            'ai_response': f"LSTM 模型預測失敗：{str(e)}",
+            'predicted_emotion': "錯誤",
+            'confidence': "0.00%"
+        }
     
     recommendation_info = logic.get(predicted_emotion, {'type': '無此類別', 'reason': '請休息'})
     
@@ -93,44 +107,55 @@ def generate_conversational_recommendation(text_input, model, logic, client):
     請根據這些資訊，生成一段流暢的鼓勵和推薦語。
     """
     
-    response = client.models.generate_content(
-        model='gemini-2.5-pro',
-        contents=prompt
-    )
-    
-    return {
-        'ai_response': response.text,
-        'predicted_emotion': predicted_emotion,
-        'confidence': f"{confidence*100:.2f}%"
-    }
+    try:
+        # 嘗試呼叫 Gemini API
+        response = client.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt
+        )
+        
+        return {
+            'ai_response': response.text,
+            'predicted_emotion': predicted_emotion,
+            'confidence': f"{confidence*100:.2f}%"
+        }
+        
+    except genai.errors.PermissionDeniedError:
+        # 專門處理 API Key 錯誤 (403) - 回傳狀態碼 200 的診斷訊息
+        return {
+            'ai_response': "Gemini API 呼叫失敗：權限遭拒。請檢查 Render 上的 GEMINI_API_KEY 是否設定正確且有效。",
+            'predicted_emotion': predicted_emotion,
+            'confidence': f"{confidence*100:.2f}%"
+        }
+    except Exception as e:
+        # 處理其他所有 API 錯誤 (如 400, 500, Timeout) - 回傳狀態碼 200 的診斷訊息
+        return {
+            'ai_response': f"Gemini API 呼叫失敗：發生未知錯誤 {type(e).__name__}，請檢查 Render 日誌。",
+            'predicted_emotion': predicted_emotion,
+            'confidence': f"{confidence*100:.2f}%"
+        }
 
 
 # --- 2. Flask API 定義 ---
 app = Flask(__name__)
+CORS(app) # 啟用 CORS
 
 @app.route('/api/recommend', methods=['POST'])
 def recommend():
     try:
-        # 接收前端 POST 過來的 JSON 資料
         data = request.get_json()
         user_text = data.get('text', '')
         
         if not user_text:
             return jsonify({"error": "Missing 'text' in request body"}), 400
 
-        # 呼叫核心推薦邏輯
+        # 呼叫核心處理函式
         result = generate_conversational_recommendation(user_text, final_model, recommendation_logic, client)
         
-        # 返回 JSON 格式的結果給前端
+        # 返回 JSON 格式的結果給前端 (即使有 Gemini 錯誤也會返回 200 狀態碼)
         return jsonify(result)
 
     except Exception as e:
         print(f"API 處理錯誤: {e}")
+        # 如果發生應用層面的錯誤，回傳 500 錯誤給前端
         return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
-
-# --- 3. 服務啟動 ---
-if __name__ == '__main__':
-    # 服務將在本地 5000 埠口運行
-    print("Flask 服務啟動中...")
-
-    app.run(host='0.0.0.0', port=5000)
