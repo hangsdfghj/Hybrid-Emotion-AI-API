@@ -1,5 +1,5 @@
 import os
-# 關鍵優化：抑制 TensorFlow 的啟動日誌和警告，以加速啟動
+# 關鍵優化：抑制 TensorFlow 的啟動日誌和警告
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # 確保使用 CPU
 
@@ -15,20 +15,26 @@ from flask_cors import CORS
 
 # --- 0. 全域變數與模型載入 (僅在服務啟動時執行一次) ---
 
-# Gemini 客戶端會自動從環境變數 GEMINI_API_KEY 讀取金鑰
 client = genai.Client()
 
 emotion_classes = np.array(['厭惡', '喜悅', '平靜', '悲傷', '憤怒', '期待', '焦慮', '驚訝']) 
 max_len = 16 
 
-# 載入你訓練好的 LSTM 模型
-try:
-    final_model = load_model('emotion_model.h5')
-    print("模型載入成功。")
-except Exception as e:
-    print(f"錯誤：無法載入 emotion_model.h5。請確認檔案是否存在。錯誤訊息: {e}")
+# 🚨 最終修正：繞過耗時的模型載入，以測試服務是否能啟動
+# 因為載入 emotion_model.h5 超過 3 分鐘或造成記憶體崩潰
 
-# 修正後的 Tokenizer 重建邏輯
+# 創建一個模擬模型 (Mock Model) 類別
+class MockEmotionModel:
+    """用於取代 TensorFlow 模型，讓服務快速啟動並模擬一個預測結果 (例如: 焦慮)。"""
+    def predict(self, padded_sequence, verbose=0):
+        # 模擬一個 '焦慮' (索引 6) 的高信心度結果
+        return np.array([[0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.65, 0.05]]) 
+# 將最終模型設置為模擬模型
+final_model = MockEmotionModel() 
+print("模型載入已旁路。正在使用模擬模型進行啟動測試。")
+
+
+# 修正後的 Tokenizer 重建邏輯 (這部分必須成功，因為是純 Python 操作)
 import pandas as pd
 from tensorflow.keras.preprocessing.text import Tokenizer
 
@@ -52,13 +58,16 @@ except FileNotFoundError:
 
 # --- 1. 核心邏輯函式 ---
 
-# 1.1 LSTM 判斷情緒
+# 1.1 LSTM 判斷情緒 (現在會使用 MockModel.predict)
 def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
-    """使用 LSTM 模型預測輸入文本的情緒。"""
+    """使用 Mock 模型預測輸入文本的情緒，以繞過 TF 載入問題。"""
+    # 這裡的分詞和 Padding 仍然是必要的步驟
     tokens = list(jieba.cut(text_input, cut_all=False))
     text_processed = [" ".join(tokens)]
     sequence = tokenizer.texts_to_sequences(text_processed)
     padded_sequence = pad_sequences(sequence, maxlen=max_len, padding='post', truncating='post')
+    
+    # 呼叫 MockModel.predict，它會回傳我們預設的 '焦慮' 結果
     predictions = model.predict(padded_sequence, verbose=0)
     
     predicted_class = np.argmax(predictions, axis=1)[0]
@@ -67,7 +76,7 @@ def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
     
     return predicted_emotion, confidence
 
-# 1.2 推薦邏輯 (情緒與活動類型的對應表)
+# 1.2 推薦邏輯 (保持不變)
 recommendation_logic = {
     '喜悅': {'type': '社交型興趣 / 分享', 'reason': '你心情超棒！是時候跟朋友分享這份喜悅，舉辦一場美食聚會吧！'},
     '悲傷': {'type': '創造型 / 發洩型興趣', 'reason': '你現在的情緒需要出口，不如拿起紙筆畫下你的心情，或寫點東西吧！讓創作替你說出那些說不出口的感受。'},
@@ -83,7 +92,7 @@ recommendation_logic = {
 def generate_conversational_recommendation(text_input, model, logic, client):
     """結合情緒預測結果，呼叫 Gemini 生成個性化的教練建議。"""
     try:
-        # 進行情緒預測
+        # 即使是 Mock 模型，我們也需要運行 predict_emotion
         predicted_emotion, confidence = predict_emotion(text_input, final_model, tokenizer, max_len, emotion_classes)
     except Exception as e:
         return {
@@ -121,14 +130,14 @@ def generate_conversational_recommendation(text_input, model, logic, client):
         }
         
     except genai.errors.PermissionDeniedError:
-        # 專門處理 API Key 錯誤 (403) - 回傳狀態碼 200 的診斷訊息
+        # 專門處理 API Key 錯誤 (403)
         return {
             'ai_response': "Gemini API 呼叫失敗：權限遭拒。請檢查 Render 上的 GEMINI_API_KEY 是否設定正確且有效。",
             'predicted_emotion': predicted_emotion,
             'confidence': f"{confidence*100:.2f}%"
         }
     except Exception as e:
-        # 處理其他所有 API 錯誤 (如 400, 500, Timeout) - 回傳狀態碼 200 的診斷訊息
+        # 處理其他所有 API 錯誤 (如 400, 500, Timeout)
         return {
             'ai_response': f"Gemini API 呼叫失敗：發生未知錯誤 {type(e).__name__}，請檢查 Render 日誌。",
             'predicted_emotion': predicted_emotion,
@@ -152,10 +161,8 @@ def recommend():
         # 呼叫核心處理函式
         result = generate_conversational_recommendation(user_text, final_model, recommendation_logic, client)
         
-        # 返回 JSON 格式的結果給前端 (即使有 Gemini 錯誤也會返回 200 狀態碼)
         return jsonify(result)
 
     except Exception as e:
         print(f"API 處理錯誤: {e}")
-        # 如果發生應用層面的錯誤，回傳 500 錯誤給前端
         return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
