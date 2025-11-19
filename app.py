@@ -5,11 +5,19 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1" # 確保使用 CPU
 
 import numpy as np
 import jieba
-import tensorflow as tf
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+# 為了避免載入錯誤，我們只在必要時導入這些
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
+    from tensorflow.keras.preprocessing.sequence import pad_sequences
+    from tensorflow.keras.preprocessing.text import Tokenizer
+    import pandas as pd
+except ImportError as e:
+    # 如果深度學習庫安裝失敗，將會在這裡捕獲
+    print(f"FATAL ERROR: 無法導入深度學習庫 ({e})。請檢查 requirements.txt!")
+    tf = None # 將這些模組設為 None 以避免後續崩潰
+
 from google import genai
-# 🚨 修正：導入 APIError 以處理所有 Gemini API 錯誤
 from google.genai.errors import APIError
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -21,8 +29,11 @@ client = genai.Client()
 emotion_classes = np.array(['厭惡', '喜悅', '平靜', '悲傷', '憤怒', '期待', '焦慮', '驚訝']) 
 max_len = 16 
 
+# 初始化 tokenizer 和 model 變數
+tokenizer = None
+final_model = None
+
 # 🚨 模型載入旁路 (Mock Model) - 保持不變，以確保啟動速度
-# 我們使用模擬模型來測試 API Key 是否正常
 class MockEmotionModel:
     """用於取代 TensorFlow 模型，讓服務快速啟動並模擬一個預測結果 (例如: 焦慮)。"""
     def predict(self, padded_sequence, verbose=0):
@@ -34,27 +45,56 @@ print("模型載入已旁路。正在使用模擬模型進行啟動測試。")
 
 
 # Tokenizer 重建邏輯
-import pandas as pd
-from tensorflow.keras.preprocessing.text import Tokenizer
+print("--- 正在嘗試重建 Tokenizer... ---")
+if tf is not None and pd is not None and Tokenizer is not None:
+    try:
+        # 載入數據用於重建 Tokenizer
+        df = pd.read_csv('emotion_data.csv', header=None, names=['text', 'emotion'])
+        
+        # 重新執行分詞與建立
+        df['tokens'] = df['text'].apply(lambda x: list(jieba.cut(x, cut_all=False)))
+        texts = [" ".join(tokens) for tokens in df['tokens']]
+        
+        # 重新建立 Tokenizer 變數
+        tokenizer = Tokenizer(num_words=5000, oov_token="<unk>") 
+        tokenizer.fit_on_texts(texts)
+        
+        print("'tokenizer' 已成功從 emotion_data.csv 重建！")
 
-print("--- 正在重建 Tokenizer... ---")
-try:
-    df = pd.read_csv('emotion_data.csv', header=None, names=['text', 'emotion'])
-    df['tokens'] = df['text'].apply(lambda x: list(jieba.cut(x, cut_all=False)))
-    texts = [" ".join(tokens) for tokens in df['tokens']]
-    tokenizer = Tokenizer(num_words=5000, oov_token="<unk>") 
-    tokenizer.fit_on_texts(texts)
-    print("'tokenizer' 已成功從 emotion_data.csv 重建！")
-except FileNotFoundError:
-    print("FATAL ERROR: 無法找到 'emotion_data.csv' 檔案。")
+    except FileNotFoundError:
+        print("CRITICAL ERROR: 無法找到 'emotion_data.csv' 檔案。Tokenizer 建立失敗。")
+        tokenizer = 'FILE_NOT_FOUND' # 設置為錯誤標誌
+    except Exception as e:
+        print(f"CRITICAL ERROR: Tokenizer 建立失敗，原因: {e}")
+        tokenizer = 'BUILD_FAILED' # 設置為錯誤標誌
+else:
+    print("CRITICAL ERROR: 由於函式庫導入失敗，Tokenizer 無法建立。")
+    tokenizer = 'LIB_FAILED'
 
-# --- 1. 核心邏輯函式 (維持不變) ---
 
+# --- 1. 核心邏輯函式 ---
+
+# 1.1 LSTM 判斷情緒 (現在會使用 MockModel.predict)
 def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
+    """使用 Mock 模型預測輸入文本的情緒，以繞過 TF 載入問題。"""
+    
+    if isinstance(tokenizer, str):
+         # 如果 Tokenizer 是一個錯誤標誌（字串），直接返回錯誤
+         return 'Tokenizer 失敗', 0.0
+         
+    # 這裡的分詞和 Padding 仍然是必要的步驟
     tokens = list(jieba.cut(text_input, cut_all=False))
     text_processed = [" ".join(tokens)]
-    sequence = tokenizer.texts_to_sequences(text_processed)
-    padded_sequence = pad_sequences(sequence, maxlen=max_len, padding='post', truncating='post')
+    
+    # 這裡可能因為 tokenizer 載入不全而崩潰
+    try:
+        sequence = tokenizer.texts_to_sequences(text_processed)
+        padded_sequence = pad_sequences(sequence, maxlen=max_len, padding='post', truncating='post')
+    except Exception as e:
+        # 如果 Tokenizer 語法級崩潰 (例如部分載入但資料不全)
+        return f'Tokenizer 處理崩潰: {str(e)[:50]}...', 0.0
+    
+    # 呼叫 MockModel.predict
     predictions = model.predict(padded_sequence, verbose=0)
     
     predicted_class = np.argmax(predictions, axis=1)[0]
@@ -63,6 +103,7 @@ def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
     
     return predicted_emotion, confidence
 
+# 1.2 推薦邏輯 (保持不變)
 recommendation_logic = {
     '喜悅': {'type': '社交型興趣 / 分享', 'reason': '你心情超棒！是時候跟朋友分享這份喜悅，舉辦一場美食聚會吧！'},
     '悲傷': {'type': '創造型 / 發洩型興趣', 'reason': '你現在的情緒需要出口，不如拿起紙筆畫下你的心情，或寫點東西吧！讓創作替你說出那些說不出口的感受。'},
@@ -71,9 +112,12 @@ recommendation_logic = {
     '平靜': {'type': '探索型 / 放鬆型興趣', 'reason': '你現在散發著穩定的能量～不妨散步探索周遭，或聽點輕音樂，享受這份難得的平和。'},
     '厭惡': {'type': '清理型 / 轉換型興趣', 'reason': '有種被東西惹毛的感覺？那正是整理的好時機！清掉煩人的雜物，讓環境和心情一起煥然一新。'},
     '期待': {'type': '計劃型 / 創作型興趣', 'reason': '你興奮得像準備開啟新關卡！趁這股能量，把你的計畫具體化吧～列清單、找靈感、做腦力激盪，讓期待變成行動。'},
-    '驚訝': {'type': '探索型 / 認知型興趣', 'reason': '哇！你的好奇心被點亮了！不如趁勢多了解一下剛剛讓你驚訝的事，查資料、看影片，讓驚訝變成有趣的新發現。'}
+    '驚訝': {'type': '探索型 / 認知型興趣', 'reason': '哇！你的好奇心被點亮了！不如趁勢多了解一下剛剛讓你驚訝的事，查資料、看影片，讓驚訝變成有趣的新發現。'},
+    'Tokenizer 失敗': {'type': '錯誤診斷', 'reason': '由於情緒分析模組未啟動，無法提供推薦。'},
+    'Tokenizer 處理崩潰': {'type': '錯誤診斷', 'reason': '情緒分析模組處理輸入時崩潰，無法提供推薦。'}
 }
 
+# 1.3 生成式推薦函式 (Gemini 組織語言與錯誤處理)
 def generate_conversational_recommendation(text_input, model, logic, client):
     """結合情緒預測結果，呼叫 Gemini 生成個性化的教練建議。"""
     try:
@@ -87,9 +131,17 @@ def generate_conversational_recommendation(text_input, model, logic, client):
     
     recommendation_info = logic.get(predicted_emotion, {'type': '無此類別', 'reason': '請休息'})
     
+    # 🚨 如果 Tokenizer 失敗，我們不呼叫 Gemini，直接返回診斷結果
+    if predicted_emotion in ['Tokenizer 失敗', 'Tokenizer 處理崩潰:']:
+        return {
+            'ai_response': f"系統錯誤診斷：{predicted_emotion}。請檢查 'emotion_data.csv' 檔案是否正確放置於伺服器。",
+            'predicted_emotion': predicted_emotion,
+            'confidence': f"{confidence*100:.2f}%"
+        }
+
+    
     prompt = f"""
-    你是一個溫暖、專業、幽默的 AI 心理教練。你對重機、電吉他、美食探索等多種興趣有深刻見解。
-    ... (略，保持提示不變)
+    你是... (略過提示詞，保持不變)
     """
     
     try:
@@ -106,24 +158,20 @@ def generate_conversational_recommendation(text_input, model, logic, client):
         }
         
     except APIError as e:
-        # 🚨 修正：捕捉通用的 APIError
         error_message = str(e)
         if "Permission denied" in error_message or "Invalid API key" in error_message:
-             # 如果是 403 錯誤，提供診斷訊息
              return {
                 'ai_response': "Gemini API 呼叫失敗：權限遭拒。請檢查 Render 上的 GEMINI_API_KEY 是否設定正確且有效。",
                 'predicted_emotion': predicted_emotion,
                 'confidence': f"{confidence*100:.2f}%"
             }
         else:
-            # 處理其他 API 錯誤 (如 Rate limit, 400, 500)
             return {
                 'ai_response': f"Gemini API 呼叫失敗：發生 API 錯誤 {type(e).__name__}，錯誤訊息：{error_message[:100]}...",
                 'predicted_emotion': predicted_emotion,
                 'confidence': f"{confidence*100:.2f}%"
             }
     except Exception as e:
-        # 處理其他所有非 API 錯誤
         return {
             'ai_response': f"Gemini API 呼叫失敗：發生未知錯誤 {type(e).__name__}，請檢查 Render 日誌。",
             'predicted_emotion': predicted_emotion,
@@ -131,12 +179,21 @@ def generate_conversational_recommendation(text_input, model, logic, client):
         }
 
 
-# --- 2. Flask API 定義 (維持不變) ---
+# --- 2. Flask API 定義 ---
 app = Flask(__name__)
-CORS(app) 
+CORS(app) # 啟用 CORS
 
 @app.route('/api/recommend', methods=['POST'])
 def recommend():
+    # 🚨 啟動前的最終檢查：如果 Tokenizer 標記為錯誤，直接返回 503
+    global tokenizer
+    if isinstance(tokenizer, str) and tokenizer in ['FILE_NOT_FOUND', 'BUILD_FAILED', 'LIB_FAILED']:
+         # 503 Service Unavailable (服務不可用) 更適合描述服務的核心依賴缺失
+         return jsonify({
+             "error": "Service Unavailable (503)",
+             "message": f"核心依賴遺失或初始化失敗。Tokenizer 狀態: {tokenizer}。請確認 'emotion_data.csv' 檔案已在 GitHub 倉庫中。"
+         }), 503
+         
     try:
         data = request.get_json()
         user_text = data.get('text', '')
@@ -144,10 +201,12 @@ def recommend():
         if not user_text:
             return jsonify({"error": "Missing 'text' in request body"}), 400
 
+        # 呼叫核心處理函式
         result = generate_conversational_recommendation(user_text, final_model, recommendation_logic, client)
         
         return jsonify(result)
 
     except Exception as e:
+        # 捕獲所有意料之外的執行期錯誤
         print(f"API 處理錯誤: {e}")
         return jsonify({"error": "Internal Server Error", "message": str(e)}), 500
