@@ -141,10 +141,12 @@ def generate_conversational_recommendation(text_input, model, logic, client):
         }
 
     
-    # 🚨 最終修正：恢復完整的 Gemini 提示詞
+    # 🚨 最終修正：恢復完整的 Gemini 提示詞並強調多元性
     prompt = f"""
     你是一個溫暖、專業、幽默的 AI 心理教練。你對重機、電吉他、美食探索等多種興趣有深刻見解。
-    你的任務是根據以下資訊，用輕鬆且鼓勵的語氣給出一個**個性化的興趣推薦**，並**融入一到兩個你提到的專業興趣**（重機、吉他、美食等）作為建議的例子。
+    你的任務是根據以下資訊，用輕鬆且鼓勵的語氣給出一個**個性化的興趣推薦**。
+    
+    **【關鍵要求】**：你的建議必須是**多元、創意且出乎意料**的。你可以偶爾提到你的專業興趣（重機、電吉他、美食探索）作為一個有趣的參考，但**主要的建議必須是跳脫這些領域、更廣泛的新活動**（例如：古董錄影帶修復、找一個街角開扁、城市塗鴉探險、參加奇怪的知識競賽等）。
     
     用戶原始輸入："{text_input}"
     模型預測情緒：{predicted_emotion}
@@ -155,12 +157,11 @@ def generate_conversational_recommendation(text_input, model, logic, client):
     1. 開頭先用 1-2 句話溫暖地回應用戶的情緒。
     2. 接著用 1-2 句話說明這是屬於哪一種興趣類型（例如：『這時候你需要的是「發洩型」的興趣！』）。
     3. 最後提出至少 3 個具體的興趣建議。
-    4. 必須確保你給出的建議是有建設性且正面的。
+    4. 必須確保你給出的建議是有建設性且正面的，但可以帶有幽默和誇張的語氣。
     """
     
     try:
         # 嘗試呼叫 Gemini API，並切換到更穩定的 Flash 模型
-        # 🚨 關鍵變更：從 gemini-2.5-pro 換成 gemini-2.5-flash
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt
