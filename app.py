@@ -24,6 +24,7 @@ from flask_cors import CORS
 
 # --- 0. 全域變數與模型載入 (僅在服務啟動時執行一次) ---
 
+# 🚨 務必在 Render 環境變數中設定 GEMINI_API_KEY
 client = genai.Client()
 
 emotion_classes = np.array(['厭惡', '喜悅', '平靜', '悲傷', '憤怒', '期待', '焦慮', '驚訝']) 
@@ -48,7 +49,7 @@ print("模型載入已旁路。正在使用模擬模型進行啟動測試。")
 print("--- 正在嘗試重建 Tokenizer... ---")
 if tf is not None and pd is not None and Tokenizer is not None:
     try:
-        # 載入數據用於重建 Tokenizer
+        # 載入數據用於重建 Tokenizer (假設 emotion_data.csv 存在於根目錄)
         df = pd.read_csv('emotion_data.csv', header=None, names=['text', 'emotion'])
         
         # 重新執行分詞與建立
@@ -91,7 +92,7 @@ def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
         sequence = tokenizer.texts_to_sequences(text_processed)
         padded_sequence = pad_sequences(sequence, maxlen=max_len, padding='post', truncating='post')
     except Exception as e:
-        # 如果 Tokenizer 語法級崩潰 (例如部分載入但資料不全)
+        # 如果 Tokenizer 語法級崩潰
         return f'Tokenizer 處理崩潰: {str(e)[:50]}...', 0.0
     
     # 呼叫 MockModel.predict
@@ -140,8 +141,21 @@ def generate_conversational_recommendation(text_input, model, logic, client):
         }
 
     
+    # 🚨 最終修正：恢復完整的 Gemini 提示詞
     prompt = f"""
-    你是... (略過提示詞，保持不變)
+    你是一個溫暖、專業、幽默的 AI 心理教練。你對重機、電吉他、美食探索等多種興趣有深刻見解。
+    你的任務是根據以下資訊，用輕鬆且鼓勵的語氣給出一個**個性化的興趣推薦**，並**融入一到兩個你提到的專業興趣**（重機、吉他、美食等）作為建議的例子。
+    
+    用戶原始輸入："{text_input}"
+    模型預測情緒：{predicted_emotion}
+    情緒建議類型：{recommendation_info['type']}
+    建議原因：{recommendation_info['reason']}
+    
+    請遵循以下格式：
+    1. 開頭先用 1-2 句話溫暖地回應用戶的情緒。
+    2. 接著用 1-2 句話說明這是屬於哪一種興趣類型（例如：『這時候你需要的是「發洩型」的興趣！』）。
+    3. 最後提出至少 3 個具體的興趣建議。
+    4. 必須確保你給出的建議是有建設性且正面的。
     """
     
     try:
