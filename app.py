@@ -159,9 +159,10 @@ def generate_conversational_recommendation(text_input, model, logic, client):
     """
     
     try:
-        # 嘗試呼叫 Gemini API
+        # 嘗試呼叫 Gemini API，並切換到更穩定的 Flash 模型
+        # 🚨 關鍵變更：從 gemini-2.5-pro 換成 gemini-2.5-flash
         response = client.models.generate_content(
-            model='gemini-2.5-pro',
+            model='gemini-2.5-flash',
             contents=prompt
         )
         
