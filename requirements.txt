@@ -6,3 +6,4 @@ jieba
 google-genai
 requests # (雖然是測試用，但最好包含)
 gunicorn # (這是生產環境中替代 Flask 內建伺服器的工具)
+flask-cors
