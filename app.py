@@ -7,6 +7,7 @@ from tensorflow.keras.preprocessing.sequence import pad_sequences
 from google import genai
 from google.genai import types
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 # --- 0. 全局變數與模型載入 (僅在服務啟動時執行一次) ---
 
@@ -131,4 +132,5 @@ def recommend():
 if __name__ == '__main__':
     # 服務將在本地 5000 埠口運行
     print("Flask 服務啟動中...")
+
     app.run(host='0.0.0.0', port=5000)
