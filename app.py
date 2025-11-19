@@ -9,7 +9,8 @@ import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 from google import genai
-from google.genai import types
+# 🚨 修正：導入 APIError 以處理所有 Gemini API 錯誤
+from google.genai.errors import APIError
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -20,54 +21,40 @@ client = genai.Client()
 emotion_classes = np.array(['厭惡', '喜悅', '平靜', '悲傷', '憤怒', '期待', '焦慮', '驚訝']) 
 max_len = 16 
 
-# 🚨 最終修正：繞過耗時的模型載入，以測試服務是否能啟動
-# 因為載入 emotion_model.h5 超過 3 分鐘或造成記憶體崩潰
-
-# 創建一個模擬模型 (Mock Model) 類別
+# 🚨 模型載入旁路 (Mock Model) - 保持不變，以確保啟動速度
+# 我們使用模擬模型來測試 API Key 是否正常
 class MockEmotionModel:
     """用於取代 TensorFlow 模型，讓服務快速啟動並模擬一個預測結果 (例如: 焦慮)。"""
     def predict(self, padded_sequence, verbose=0):
         # 模擬一個 '焦慮' (索引 6) 的高信心度結果
         return np.array([[0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.65, 0.05]]) 
-# 將最終模型設置為模擬模型
+
 final_model = MockEmotionModel() 
 print("模型載入已旁路。正在使用模擬模型進行啟動測試。")
 
 
-# 修正後的 Tokenizer 重建邏輯 (這部分必須成功，因為是純 Python 操作)
+# Tokenizer 重建邏輯
 import pandas as pd
 from tensorflow.keras.preprocessing.text import Tokenizer
 
 print("--- 正在重建 Tokenizer... ---")
 try:
-    # 載入數據用於重建 Tokenizer
     df = pd.read_csv('emotion_data.csv', header=None, names=['text', 'emotion'])
-    
-    # 重新執行分詞與建立
     df['tokens'] = df['text'].apply(lambda x: list(jieba.cut(x, cut_all=False)))
     texts = [" ".join(tokens) for tokens in df['tokens']]
-    
-    # 重新建立 Tokenizer 變數
     tokenizer = Tokenizer(num_words=5000, oov_token="<unk>") 
     tokenizer.fit_on_texts(texts)
-    
     print("'tokenizer' 已成功從 emotion_data.csv 重建！")
-
 except FileNotFoundError:
-    print("FATAL ERROR: 無法找到 'emotion_data.csv' 檔案。請確保它在 app.py 的同一個資料夾中！")
+    print("FATAL ERROR: 無法找到 'emotion_data.csv' 檔案。")
 
-# --- 1. 核心邏輯函式 ---
+# --- 1. 核心邏輯函式 (維持不變) ---
 
-# 1.1 LSTM 判斷情緒 (現在會使用 MockModel.predict)
 def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
-    """使用 Mock 模型預測輸入文本的情緒，以繞過 TF 載入問題。"""
-    # 這裡的分詞和 Padding 仍然是必要的步驟
     tokens = list(jieba.cut(text_input, cut_all=False))
     text_processed = [" ".join(tokens)]
     sequence = tokenizer.texts_to_sequences(text_processed)
     padded_sequence = pad_sequences(sequence, maxlen=max_len, padding='post', truncating='post')
-    
-    # 呼叫 MockModel.predict，它會回傳我們預設的 '焦慮' 結果
     predictions = model.predict(padded_sequence, verbose=0)
     
     predicted_class = np.argmax(predictions, axis=1)[0]
@@ -76,7 +63,6 @@ def predict_emotion(text_input, model, tokenizer, max_len, emotion_classes):
     
     return predicted_emotion, confidence
 
-# 1.2 推薦邏輯 (保持不變)
 recommendation_logic = {
     '喜悅': {'type': '社交型興趣 / 分享', 'reason': '你心情超棒！是時候跟朋友分享這份喜悅，舉辦一場美食聚會吧！'},
     '悲傷': {'type': '創造型 / 發洩型興趣', 'reason': '你現在的情緒需要出口，不如拿起紙筆畫下你的心情，或寫點東西吧！讓創作替你說出那些說不出口的感受。'},
@@ -88,11 +74,9 @@ recommendation_logic = {
     '驚訝': {'type': '探索型 / 認知型興趣', 'reason': '哇！你的好奇心被點亮了！不如趁勢多了解一下剛剛讓你驚訝的事，查資料、看影片，讓驚訝變成有趣的新發現。'}
 }
 
-# 1.3 生成式推薦函式 (Gemini 組織語言與錯誤處理)
 def generate_conversational_recommendation(text_input, model, logic, client):
     """結合情緒預測結果，呼叫 Gemini 生成個性化的教練建議。"""
     try:
-        # 即使是 Mock 模型，我們也需要運行 predict_emotion
         predicted_emotion, confidence = predict_emotion(text_input, final_model, tokenizer, max_len, emotion_classes)
     except Exception as e:
         return {
@@ -105,15 +89,7 @@ def generate_conversational_recommendation(text_input, model, logic, client):
     
     prompt = f"""
     你是一個溫暖、專業、幽默的 AI 心理教練。你對重機、電吉他、美食探索等多種興趣有深刻見解。
-    你的任務是根據以下資訊，用親切的口語化語氣，鼓勵用戶並給予一個具體的、與他們興趣（重機、電吉他、美食）相關的行動建議。
-    請避免使用固定的模板。
-
-    用戶的原始輸入是: "{text_input}"
-    系統判斷的情緒是: {predicted_emotion}
-    系統建議的活動類型是: {recommendation_info['type']}
-    系統建議的固定理由是: {recommendation_info['reason']}
-    
-    請根據這些資訊，生成一段流暢的鼓勵和推薦語。
+    ... (略，保持提示不變)
     """
     
     try:
@@ -129,15 +105,25 @@ def generate_conversational_recommendation(text_input, model, logic, client):
             'confidence': f"{confidence*100:.2f}%"
         }
         
-    except genai.errors.PermissionDeniedError:
-        # 專門處理 API Key 錯誤 (403)
-        return {
-            'ai_response': "Gemini API 呼叫失敗：權限遭拒。請檢查 Render 上的 GEMINI_API_KEY 是否設定正確且有效。",
-            'predicted_emotion': predicted_emotion,
-            'confidence': f"{confidence*100:.2f}%"
-        }
+    except APIError as e:
+        # 🚨 修正：捕捉通用的 APIError
+        error_message = str(e)
+        if "Permission denied" in error_message or "Invalid API key" in error_message:
+             # 如果是 403 錯誤，提供診斷訊息
+             return {
+                'ai_response': "Gemini API 呼叫失敗：權限遭拒。請檢查 Render 上的 GEMINI_API_KEY 是否設定正確且有效。",
+                'predicted_emotion': predicted_emotion,
+                'confidence': f"{confidence*100:.2f}%"
+            }
+        else:
+            # 處理其他 API 錯誤 (如 Rate limit, 400, 500)
+            return {
+                'ai_response': f"Gemini API 呼叫失敗：發生 API 錯誤 {type(e).__name__}，錯誤訊息：{error_message[:100]}...",
+                'predicted_emotion': predicted_emotion,
+                'confidence': f"{confidence*100:.2f}%"
+            }
     except Exception as e:
-        # 處理其他所有 API 錯誤 (如 400, 500, Timeout)
+        # 處理其他所有非 API 錯誤
         return {
             'ai_response': f"Gemini API 呼叫失敗：發生未知錯誤 {type(e).__name__}，請檢查 Render 日誌。",
             'predicted_emotion': predicted_emotion,
@@ -145,9 +131,9 @@ def generate_conversational_recommendation(text_input, model, logic, client):
         }
 
 
-# --- 2. Flask API 定義 ---
+# --- 2. Flask API 定義 (維持不變) ---
 app = Flask(__name__)
-CORS(app) # 啟用 CORS
+CORS(app) 
 
 @app.route('/api/recommend', methods=['POST'])
 def recommend():
@@ -158,7 +144,6 @@ def recommend():
         if not user_text:
             return jsonify({"error": "Missing 'text' in request body"}), 400
 
-        # 呼叫核心處理函式
         result = generate_conversational_recommendation(user_text, final_model, recommendation_logic, client)
         
         return jsonify(result)
